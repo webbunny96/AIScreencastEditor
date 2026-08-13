@@ -16,12 +16,122 @@ import RegionsPlugin from 'wavesurfer.js/dist/plugins/regions';
 import type { Region } from 'wavesurfer.js/dist/plugins/regions';
 import { useEditorStore, selectEDL, selectCurrentTime, selectJobId } from '../store/useEditorStore';
 
+interface SilenceRegion {
+  start: number;
+  end: number;
+}
+
+/**
+ * Compute silence regions from audio buffer data.
+ * Divides audio into frames, calculates RMS amplitude per frame,
+ * and groups consecutive low-amplitude frames into silence regions.
+ */
+const computeSilenceRegions = (audioBuffer: AudioBuffer): SilenceRegion[] => {
+  const channelData = audioBuffer.getChannelData(0);
+  const sampleRate = audioBuffer.sampleRate;
+  const duration = audioBuffer.duration;
+
+  // Limit total frames to ~3000 for performance on long files
+  const targetFrames = 3000;
+  const frameSize = Math.max(
+    Math.floor(sampleRate * 0.1), // minimum 100ms per frame
+    Math.floor(channelData.length / targetFrames)
+  );
+
+  const threshold = 0.02; // RMS threshold below which audio is considered silence
+  const minSilenceDuration = 0.3; // minimum silence length in seconds
+
+  const silenceRanges: SilenceRegion[] = [];
+  let currentStart: number | null = null;
+
+  for (let i = 0; i < channelData.length; i += frameSize) {
+    const end = Math.min(i + frameSize, channelData.length);
+
+    // Compute RMS, sampling at most ~1000 points per frame for speed
+    let sum = 0;
+    const step = Math.max(1, Math.floor((end - i) / 1000));
+    let count = 0;
+    for (let j = i; j < end; j += step) {
+      const val = channelData[j];
+      sum += val * val;
+      count++;
+    }
+    const rms = count > 0 ? Math.sqrt(sum / count) : 0;
+
+    const frameStart = i / sampleRate;
+    const frameEnd = end / sampleRate;
+
+    if (rms < threshold) {
+      if (currentStart === null) {
+        currentStart = frameStart;
+      }
+    } else {
+      if (currentStart !== null) {
+        if (frameStart - currentStart >= minSilenceDuration) {
+          silenceRanges.push({ start: currentStart, end: frameStart });
+        }
+        currentStart = null;
+      }
+    }
+
+    if (frameEnd >= duration) break;
+  }
+
+  // Handle trailing silence
+  if (currentStart !== null && duration - currentStart >= minSilenceDuration) {
+    silenceRanges.push({ start: currentStart, end: duration });
+  }
+
+  return silenceRanges;
+};
+
+/**
+ * Remove portions of silence regions that overlap with "keep" segments,
+ * so silence is only shown in gaps where the speaker is not talking.
+ */
+const filterOverlappingKeep = (
+  silenceRegions: SilenceRegion[],
+  edl: { id: number; start: number; end: number; keep: boolean }[]
+): SilenceRegion[] => {
+  const keptSegments = edl.filter(s => s.keep);
+  if (keptSegments.length === 0) return silenceRegions;
+
+  const result: SilenceRegion[] = [];
+  const minVisibleLength = 0.3;
+
+  for (const silence of silenceRegions) {
+    let cursor = silence.start;
+
+    const overlapping = keptSegments
+      .filter(s => s.start < silence.end && s.end > silence.start)
+      .sort((a, b) => a.start - b.start);
+
+    for (const seg of overlapping) {
+      if (seg.start > cursor) {
+        const gapEnd = Math.min(seg.start, silence.end);
+        if (gapEnd - cursor >= minVisibleLength) {
+          result.push({ start: cursor, end: gapEnd });
+        }
+      }
+      cursor = Math.max(cursor, seg.end);
+      if (cursor >= silence.end) break;
+    }
+
+    if (cursor < silence.end && silence.end - cursor >= minVisibleLength) {
+      result.push({ start: cursor, end: silence.end });
+    }
+  }
+
+  return result;
+};
+
 export function Timeline() {
   const containerRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WaveSurfer | null>(null);
   const regionsPluginRef = useRef<RegionsPlugin | null>(null);
   const [isReady, setIsReady] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [silenceRegions, setSilenceRegions] = useState<SilenceRegion[]>([]);
   
   const edl = useEditorStore(selectEDL);
   const currentTime = useEditorStore(selectCurrentTime);
@@ -34,7 +144,7 @@ export function Timeline() {
     edlRef.current = edl;
   }, [edl]);
 
-  // Initialize wavesurfer
+  // Initialize wavesurfer with retry for audio-not-ready (404)
   useEffect(() => {
     if (!containerRef.current || !jobId) return;
 
@@ -60,16 +170,48 @@ export function Timeline() {
 
     setIsLoading(true);
 
+    // Retry loading audio if it's not ready yet (e.g. extraction still in progress).
+    // Keeps retrying every 2s for up to MAX_ATTEMPTS times.
+    let retryAttempts = 0;
+    const MAX_RETRY_ATTEMPTS = 60; // 60 * 2s = 120s max wait
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const tryLoadAudio = () => {
+      if (wsRef.current) {
+        wsRef.current.load(`/api/upload/${jobId}/audio-file`);
+      }
+    };
+
     ws.on('ready', () => {
       setIsLoading(false);
       setIsReady(true);
+      retryAttempts = 0;
       const duration = ws.getDuration();
       if (duration) setDuration(duration);
+
+      // Analyze audio data to detect silence/noise regions
+      const decoded = ws.getDecodedData();
+      if (decoded) {
+        // Use setTimeout to avoid blocking the UI during analysis
+        setTimeout(() => {
+          const regions = computeSilenceRegions(decoded);
+          setSilenceRegions(regions);
+        }, 0);
+      }
     });
 
     ws.on('error', () => {
-      setIsLoading(false);
-      setIsReady(true);
+      // Audio not ready yet — retry with backoff
+      retryAttempts += 1;
+      if (retryAttempts < MAX_RETRY_ATTEMPTS) {
+        if (retryTimer) clearTimeout(retryTimer);
+        retryTimer = setTimeout(() => {
+          tryLoadAudio();
+        }, 2000);
+      } else {
+        setIsLoading(false);
+        setIsReady(true);
+      }
     });
 
     // Click to seek (only when not dragging a region edge)
@@ -79,10 +221,12 @@ export function Timeline() {
     });
 
     return () => {
+      if (retryTimer) clearTimeout(retryTimer);
       ws.destroy();
       wsRef.current = null;
       regionsPluginRef.current = null;
       setIsReady(false);
+      setSilenceRegions([]);
     };
   }, [jobId, seek, setDuration]);
 
@@ -93,6 +237,21 @@ export function Timeline() {
     const plugin = regionsPluginRef.current;
     plugin.clearRegions();
 
+    // Render silence regions first (behind EDL segments)
+    const visibleSilence = filterOverlappingKeep(silenceRegions, edl);
+    visibleSilence.forEach((region, i) => {
+      plugin.addRegion({
+        id: `sil-${i}`,
+        start: region.start,
+        end: region.end,
+        color: 'rgba(250, 204, 21, 0.15)',  // yellow - silence/noise
+        drag: false,
+        resize: false,
+        minLength: 0.2,
+      });
+    });
+
+    // Render EDL segments on top
     edl.forEach((segment) => {
       const color = segment.keep 
         ? 'rgba(34, 197, 94, 0.3)'   // green
@@ -108,7 +267,7 @@ export function Timeline() {
         minLength: 0.5,
       });
     });
-  }, [edl, isReady]);
+  }, [edl, isReady, silenceRegions]);
 
   // Handle region updates (drag handles)
   useEffect(() => {
@@ -177,6 +336,10 @@ export function Timeline() {
             <span className="w-3 h-3 bg-red-400 rounded-sm"></span>
             <span className="text-gray-600 dark:text-gray-400">{removedCount} removed</span>
           </span>
+          <span className="flex items-center space-x-1">
+            <span className="w-3 h-3 bg-yellow-400/20 border border-yellow-400 rounded-sm"></span>
+            <span className="text-gray-600 dark:text-gray-400">silence</span>
+          </span>
         </div>
       </div>
 
@@ -213,6 +376,10 @@ export function Timeline() {
           <span className="flex items-center space-x-1">
             <span className="w-3 h-3 bg-red-400/25 border border-red-400 rounded-sm"></span>
             <span>Remove</span>
+          </span>
+          <span className="flex items-center space-x-1">
+            <span className="w-3 h-3 bg-yellow-400/15 border border-yellow-400 rounded-sm"></span>
+            <span>Silence / Noise</span>
           </span>
         </div>
         <span>{formatTime(currentTime)}</span>

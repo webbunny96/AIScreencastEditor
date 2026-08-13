@@ -163,7 +163,7 @@ class TestLLMParsing:
         )
         analyzer.client.chat.completions.create.return_value = mock_response
 
-        keep_ids, remove_ids, reasons = analyzer._analyze_segments_sync(sample_segments)
+        keep_ids, remove_ids, reasons = analyzer._call_llm_with_retry(sample_segments)
 
         assert keep_ids == [1, 3, 5]
         assert remove_ids == [2, 4]
@@ -173,12 +173,8 @@ class TestLLMParsing:
         """Test fallback when LLM fails (keep all segments)"""
         analyzer.client.chat.completions.create.side_effect = Exception("API error")
 
-        keep_ids, remove_ids, reasons = analyzer._analyze_segments_sync(sample_segments)
-
-        # Fallback: keep all segments
-        assert keep_ids == [1, 2, 3, 4, 5]
-        assert remove_ids == []
-        assert reasons == {}
+        with pytest.raises(RuntimeError):
+            analyzer._call_llm_with_retry(sample_segments)
 
     def test_prepare_segments_for_llm(self, analyzer, sample_segments):
         """Test that segments are prepared with minimal payload"""

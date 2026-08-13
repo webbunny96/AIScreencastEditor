@@ -2,12 +2,13 @@
  * MainEditor Component - main layout with video player, transcript, and timeline
  */
 import { useRef, useCallback, useState } from 'react';
-import { Upload, Loader2, Sparkles, Film } from 'lucide-react';
+import { Upload, Loader2, Sparkles, Film, Clock } from 'lucide-react';
 import { VideoPlayer } from './VideoPlayer';
 import { Transcript } from './Transcript';
 import { Timeline } from './Timeline';
 import { ExportModal } from './ExportModal';
 import { useEditorStore } from '../store/useEditorStore';
+import { useETA } from '../hooks/useETA';
 
 interface SegmentDTO {
   id: number;
@@ -47,7 +48,21 @@ export function MainEditor() {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isExportOpen, setIsExportOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [uploadProgress, setUploadProgress] = useState(0);
   const { setEDL, setJobId, setVideoUrl, setOriginalFilename, edl, jobId, originalFilename } = useEditorStore();
+  
+  // Estimated remaining time (countdown) for long-running tasks
+  // - Upload: based on actual progress percentage
+  // - Extract: estimated ~10s for short, up to 60s for long videos
+  // - Transcribe: estimated ~30s per minute of video (CPU whisper)
+  // - Analyze: LLM analysis ~5s + processing time
+  const uploadETA = useETA(isUploading, uploadProgress);
+  const extractETA = useETA(isExtractingAudio, null, 60);
+  const transcribeETA = useETA(isTranscribing, null, 900);  // 15 min max for very long videos
+  const analyzeETA = useETA(isAnalyzing, null, 120);  // 2 min max for LLM
+
+  // Network progress tracking for upload
+  const trackUploadProgress = (progress: number) => setUploadProgress(progress);
 
   const runAnalyze = useCallback(async (targetJobId: string) => {
     try {
@@ -83,9 +98,35 @@ export function MainEditor() {
       setError(null); setIsUploading(true);
       const formData = new FormData();
       formData.append('file', file);
-      const res = await fetch('/api/upload/', { method: 'POST', body: formData });
-      if (!res.ok) throw new Error((await res.json()).detail || 'Upload failed');
+      // Track upload progress using XMLHttpRequest for progress events
+      const xhr = new XMLHttpRequest();
+      const uploadProgressPromise = new Promise<void>((resolve, reject) => {
+        xhr.open('POST', '/api/upload/');
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable) {
+            trackUploadProgress(Math.round((e.loaded / e.total) * 100));
+          }
+        };
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            resolve();
+          } else {
+            try {
+              const errorData = JSON.parse(xhr.responseText);
+              reject(new Error(errorData.detail || 'Upload failed'));
+            } catch {
+              reject(new Error('Upload failed'));
+            }
+          }
+        };
+        xhr.onerror = () => reject(new Error('Network error during upload'));
+        xhr.send(formData);
+      });
+      
+      await uploadProgressPromise;
+      const res = { ok: true, json: async () => JSON.parse(xhr.responseText) };
       const data = await res.json();
+      setUploadProgress(100);
       setJobId(data.job_id);
       setVideoUrl(`/api/upload/${data.job_id}/video`);
       setOriginalFilename(data.filename);
@@ -135,7 +176,7 @@ export function MainEditor() {
                 className="flex items-center space-x-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {isUploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
-                <span>{isUploading ? 'Uploading...' : 'Upload Video'}</span>
+                <span>{isUploading ? `Uploading ${uploadProgress}%...` : 'Upload Video'}</span>
               </button>
             ) : (
               <div className="flex items-center space-x-2 min-w-0">
@@ -147,16 +188,25 @@ export function MainEditor() {
             {isExtractingAudio && (
               <span className="flex items-center space-x-1 text-sm text-amber-600 dark:text-amber-400">
                 <Loader2 className="w-3 h-3 animate-spin" /><span>Extracting audio...</span>
+                <span className="flex items-center space-x-0.5 ml-1 font-mono text-xs bg-amber-100 dark:bg-amber-900/30 px-1.5 py-0.5 rounded">
+                  <Clock className="w-3 h-3" /><span>{extractETA ?? '...'}</span>
+                </span>
               </span>
             )}
             {isTranscribing && (
               <span className="flex items-center space-x-1 text-sm text-blue-600 dark:text-blue-400">
                 <Loader2 className="w-3 h-3 animate-spin" /><span>Transcribing...</span>
+                <span className="flex items-center space-x-0.5 ml-1 font-mono text-xs bg-blue-100 dark:bg-blue-900/30 px-1.5 py-0.5 rounded">
+                  <Clock className="w-3 h-3" /><span>{transcribeETA ?? '...'}</span>
+                </span>
               </span>
             )}
             {isAnalyzing && (
               <span className="flex items-center space-x-1 text-sm text-purple-600 dark:text-purple-400">
                 <Sparkles className="w-3 h-3 animate-spin" /><span>AI Analyzing...</span>
+                <span className="flex items-center space-x-0.5 ml-1 font-mono text-xs bg-purple-100 dark:bg-purple-900/30 px-1.5 py-0.5 rounded">
+                  <Clock className="w-3 h-3" /><span>{analyzeETA ?? '...'}</span>
+                </span>
               </span>
             )}
           </div>
@@ -176,6 +226,25 @@ export function MainEditor() {
             </div>
           )}
         </div>
+        {/* Upload progress bar */}
+        {isUploading && (
+          <div className="mt-3">
+            <div className="flex items-center justify-between text-xs mb-1">
+              <span className="text-blue-600 dark:text-blue-400 flex items-center">
+                <Loader2 className="w-3 h-3 animate-spin mr-1" />Uploading...
+              </span>
+              <span className="flex items-center font-mono text-gray-600 dark:text-gray-400">
+                <Clock className="w-3 h-3 mr-1" />{uploadETA ?? '...'} · {uploadProgress}%
+              </span>
+            </div>
+            <div className="h-1.5 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
+              <div
+                className="h-full bg-blue-500 transition-all duration-300"
+                style={{ width: `${uploadProgress}%` }}
+              />
+            </div>
+          </div>
+        )}
         {error && (
           <div className="mt-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg px-4 py-3 text-sm text-red-700 dark:text-red-300 flex items-center justify-between">
             <span>{error}</span>

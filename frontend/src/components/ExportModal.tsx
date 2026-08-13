@@ -6,6 +6,7 @@
 import { useState, useCallback, useEffect } from 'react';
 import { X, Download, Settings, Film, Video, Zap, Clock } from 'lucide-react';
 import { useEditorStore, selectEDL } from '../store/useEditorStore';
+import { useETA } from '../hooks/useETA';
 
 interface ExportModalProps {
   isOpen: boolean;
@@ -52,6 +53,7 @@ export function ExportModal({ isOpen, onClose }: ExportModalProps) {
   const [exportStatus, setExportStatus] = useState<string>('');
   const [exportId, setExportId] = useState<string | null>(null);
   const [isComplete, setIsComplete] = useState(false);
+  const exportETA = useETA(isExporting, exportProgress);
   
   // Calculate estimated file size (rough estimate)
   const calculateEstimatedSize = () => {
@@ -357,7 +359,12 @@ export function ExportModal({ isOpen, onClose }: ExportModalProps) {
             <div className="space-y-2">
               <div className="flex items-center justify-between text-sm">
                 <span className="text-gray-600 dark:text-gray-400">{exportStatus}</span>
-                <span className="font-medium text-gray-900 dark:text-white">{exportProgress}%</span>
+                <span className="flex items-center font-mono text-xs text-gray-500 dark:text-gray-400 space-x-1">
+                  <Clock className="w-3 h-3" />
+                  <span>{(exportETA ?? '...')}</span>
+                  <span className="mx-1">·</span>
+                  <span className="font-medium text-gray-900 dark:text-white">{exportProgress}%</span>
+                </span>
               </div>
               <div className="h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
                 <div

@@ -26,6 +26,13 @@ class EDLSegment:
 class AIAnalyzerService:
     """Service for analyzing transcripts and identifying fluff content"""
     
+    # Maximum segments per LLM request to avoid timeout (504) on large files
+    MAX_SEGMENTS_PER_CHUNK = 40
+    # Number of retry attempts for transient errors
+    MAX_RETRIES = 3
+    # Base delay between retries (seconds), doubles each attempt
+    RETRY_BASE_DELAY = 2.0
+    
     def __init__(self):
         self.client: OpenAI | None = None
         self._initialize_client()
@@ -34,7 +41,9 @@ class AIAnalyzerService:
         """Initialize OpenAI client configured for NVIDIA NIM API"""
         self.client = OpenAI(
             base_url=settings.NVIDIA_BASE_URL,
-            api_key=settings.NVIDIA_API_KEY
+            api_key=settings.NVIDIA_API_KEY,
+            timeout=120.0,  # Longer timeout for large chunks
+            max_retries=0   # We handle retries manually with backoff
         )
     
     def _prepare_segments_for_llm(self, segments: List[Dict]) -> str:
@@ -49,6 +58,19 @@ class AIAnalyzerService:
                 "text": segment["text"].strip()
             })
         return json.dumps(prepared, ensure_ascii=False)
+    
+    def _chunk_segments(self, segments: List[Dict]) -> List[List[Dict]]:
+        """
+        Split segments into smaller chunks to avoid LLM timeouts on large files.
+        Returns list of segment chunks, each with at most MAX_SEGMENTS_PER_CHUNK entries.
+        """
+        if len(segments) <= self.MAX_SEGMENTS_PER_CHUNK:
+            return [segments]
+        
+        chunks = []
+        for i in range(0, len(segments), self.MAX_SEGMENTS_PER_CHUNK):
+            chunks.append(segments[i:i + self.MAX_SEGMENTS_PER_CHUNK])
+        return chunks
     
     def _get_system_prompt(self) -> str:
         """Get the system prompt for the LLM"""
@@ -100,22 +122,11 @@ TRANSCRIPT SEGMENTS:
 
 ANALYSIS:"""
     
-    async def analyze_segments_async(self, segments: List[Dict]) -> Tuple[List[int], List[int], Dict[str, str]]:
+    def _call_llm_with_retry(self, segments: List[Dict]) -> Tuple[List[int], List[int], Dict[str, str]]:
         """
-        Analyze segments asynchronously to identify fluff.
-        Returns tuple of (keep_ids, remove_ids, reasons).
-        """
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None,
-            self._analyze_segments_sync,
-            segments
-        )
-    
-    def _analyze_segments_sync(self, segments: List[Dict]) -> Tuple[List[int], List[int], Dict[str, str]]:
-        """
-        Synchronous analysis using LLM.
-        Must be run in thread pool to avoid blocking.
+        Call LLM with exponential backoff retry for transient errors.
+        Returns (keep_ids, remove_ids, reasons).
+        Raises RuntimeError if all retries fail.
         """
         # Prepare segments for LLM
         segments_json = self._prepare_segments_for_llm(segments)
@@ -124,42 +135,111 @@ ANALYSIS:"""
         system_prompt = self._get_system_prompt()
         user_prompt = self._get_user_prompt(segments_json)
         
-        try:
-            if self.client is None:
-                self._initialize_client()
-            assert self.client is not None
-            # Call LLM via NVIDIA NIM API
-            response = self.client.chat.completions.create(
-                model=settings.LLM_MODEL,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.1,  # Low temperature for consistent output
-                max_tokens=4000,
-                response_format={"type": "json_object"}  # Ensure JSON output
+        last_error: Optional[Exception] = None
+        
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                if self.client is None:
+                    self._initialize_client()
+                assert self.client is not None
+                
+                # Call LLM via NVIDIA NIM API
+                response = self.client.chat.completions.create(
+                    model=settings.LLM_MODEL,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    temperature=0.1,  # Low temperature for consistent output
+                    max_tokens=4000,
+                    response_format={"type": "json_object"}  # Ensure JSON output
+                )
+                
+                # Parse response
+                result_text = response.choices[0].message.content.strip()
+                
+                # Extract JSON from response (handle potential markdown formatting)
+                json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+                if json_match:
+                    result_json = json.loads(json_match.group())
+                else:
+                    result_json = json.loads(result_text)
+                
+                keep_ids = result_json.get("keep_ids", [])
+                remove_ids = result_json.get("remove_ids", [])
+                reasons = result_json.get("reasons", {})
+                
+                return keep_ids, remove_ids, reasons
+                
+            except Exception as e:
+                last_error = e
+                print(f"LLM analysis attempt {attempt + 1}/{self.MAX_RETRIES} failed: {e}")
+                
+                # Exponential backoff before retry (except on last attempt)
+                if attempt < self.MAX_RETRIES - 1:
+                    import time
+                    delay = self.RETRY_BASE_DELAY * (2 ** attempt)
+                    time.sleep(delay)
+        
+        raise RuntimeError(f"LLM analysis failed after {self.MAX_RETRIES} attempts: {last_error}")
+    
+    async def analyze_segments_async(self, segments: List[Dict]) -> Tuple[List[int], List[int], Dict[str, str]]:
+        """
+        Analyze segments asynchronously to identify fluff.
+        Handles large transcripts by splitting into chunks and analyzing in parallel.
+        Returns tuple of (keep_ids, remove_ids, reasons).
+        """
+        # Split into chunks for large transcripts
+        chunks = self._chunk_segments(segments)
+        
+        loop = asyncio.get_event_loop()
+        
+        if len(chunks) == 1:
+            # Single chunk - just run in executor
+            keep_ids, remove_ids, reasons = await loop.run_in_executor(
+                None,
+                self._call_llm_with_retry,
+                chunks[0]
             )
-            
-            # Parse response
-            result_text = response.choices[0].message.content.strip()
-            
-            # Extract JSON from response (handle potential markdown formatting)
-            json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
-            if json_match:
-                result_json = json.loads(json_match.group())
-            else:
-                result_json = json.loads(result_text)
-            
-            keep_ids = result_json.get("keep_ids", [])
-            remove_ids = result_json.get("remove_ids", [])
-            reasons = result_json.get("reasons", {})
-            
             return keep_ids, remove_ids, reasons
+        
+        # Multiple chunks - analyze in parallel
+        print(f"Processing {len(segments)} segments in {len(chunks)} chunks (parallel analysis)")
+        
+        async def analyze_chunk(chunk: List[Dict]) -> Tuple[List[int], List[int], Dict[str, str]]:
+            return await loop.run_in_executor(
+                None,
+                self._call_llm_with_retry,
+                chunk
+            )
+        
+        # Run all chunk analyses in parallel
+        results = await asyncio.gather(
+            *[analyze_chunk(chunk) for chunk in chunks],
+            return_exceptions=True
+        )
+        
+        # Merge results
+        all_keep_ids: List[int] = []
+        all_remove_ids: List[int] = []
+        all_reasons: Dict[str, str] = {}
+        
+        for result in results:
+            if isinstance(result, BaseException):
+                print(f"Chunk analysis failed: {result}")
+                # Failed chunk: keep those segments (conservative fallback)
+                continue
             
-        except Exception as e:
-            print(f"LLM analysis failed: {e}")
-            # Fallback: keep all segments
-            return [s["id"] for s in segments], [], {}
+            keep_ids, remove_ids, reasons = result
+            all_keep_ids.extend(keep_ids)
+            all_remove_ids.extend(remove_ids)
+            all_reasons.update(reasons)
+        
+        # If ALL chunks failed, raise so caller can handle
+        if not all_keep_ids and not all_remove_ids:
+            raise RuntimeError("All LLM chunks failed")
+        
+        return all_keep_ids, all_remove_ids, all_reasons
     
     def generate_edl(
         self, 
